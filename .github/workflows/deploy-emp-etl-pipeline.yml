@@ -162,6 +162,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Empty S3 buckets before deleting stack
+        run: |
+          echo "Emptying input bucket (if it exists)..."
+          aws s3 rm s3://${{ env.INPUT_BUCKET }} --recursive --region ${{ env.AWS_REGION }} || true
+          echo "Emptying output bucket (if it exists)..."
+          aws s3 rm s3://${{ env.OUTPUT_BUCKET }} --recursive --region ${{ env.AWS_REGION }} || true
+
       - name: Delete CloudFormation stack
         run: |
           aws cloudformation delete-stack \
