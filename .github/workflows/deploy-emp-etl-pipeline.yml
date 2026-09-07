@@ -22,6 +22,9 @@ env:
   AWS_REGION: ap-southeast-2
   STACK_NAME: emp-etl-pipeline-v2
   TEMPLATE_FILE: emp-etl-pipeline-v2.yaml
+  INPUT_BUCKET: emp-data-csv-input-v2
+  GLUE_SCRIPT_LOCAL_PATH: glue_job.py
+  GLUE_SCRIPT_S3_KEY: scripts/glue_job.py
 
 jobs:
   deploy:
@@ -51,6 +54,12 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM \
             --region ${{ env.AWS_REGION }} \
             --no-fail-on-empty-changeset
+
+      - name: Upload Glue ETL script to S3
+        run: |
+          aws s3 cp ${{ env.GLUE_SCRIPT_LOCAL_PATH }} \
+            s3://${{ env.INPUT_BUCKET }}/${{ env.GLUE_SCRIPT_S3_KEY }} \
+            --region ${{ env.AWS_REGION }}
 
       - name: Show stack outputs
         run: |
