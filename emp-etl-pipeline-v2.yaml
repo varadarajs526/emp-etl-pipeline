@@ -52,7 +52,7 @@ Resources:
 
   InputBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
+    DeletionPolicy: Delete
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref InputBucketName
