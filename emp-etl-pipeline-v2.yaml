@@ -1,0 +1,442 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Employee ETL Pipeline - S3 (input/output) -> Lambda trigger -> Glue Workflow
+  (Job -> Crawler) -> Glue Data Catalog. Recreates the manually-built pipeline
+  as a single CloudFormation stack for repeatable create/destroy.
+
+Parameters:
+  InputBucketName:
+    Type: String
+    Default: emp-data-csv-input-v2
+    Description: Name of the S3 bucket that receives input CSVs and holds the ETL script.
+
+  OutputBucketName:
+    Type: String
+    Default: emp-data-csv-output-v2
+    Description: Name of the S3 bucket that receives ETL output CSVs.
+
+  GlueScriptKey:
+    Type: String
+    Default: scripts/glue_job.py
+    Description: >
+      S3 key (within the input bucket) where glue_job.py already exists.
+      This template does NOT upload the script - upload/keep it there before
+      the Glue Job is created, or the job will fail to start.
+
+  GlueDatabaseName:
+    Type: String
+    Default: emp_etl_db_v2
+    Description: Glue Data Catalog database name.
+
+  GlueJobName:
+    Type: String
+    Default: emp-etl-job-v2
+
+  GlueCrawlerName:
+    Type: String
+    Default: emp-output-crawler-v2
+
+  GlueWorkflowName:
+    Type: String
+    Default: emp-etl-workflow-v2
+
+  LambdaFunctionName:
+    Type: String
+    Default: start-emp-etl-workflow-v2
+
+Resources:
+
+  ############################################
+  # S3 Buckets
+  ############################################
+
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref InputBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref OutputBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ############################################
+  # IAM Role - Glue
+  ############################################
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSGlueServiceRole-EmpETL-v2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueETLLeastPrivilegePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListBuckets
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${InputBucketName}
+                  - !Sub arn:aws:s3:::${OutputBucketName}
+              - Sid: ReadInputAndScripts
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${InputBucketName}/input/*
+                  - !Sub arn:aws:s3:::${InputBucketName}/scripts/*
+              - Sid: ReadWriteOutput
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${OutputBucketName}/*
+              - Sid: GlueCatalogAccess
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:CreateDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:BatchCreatePartition
+                  - glue:BatchGetPartition
+                Resource: '*'
+              - Sid: GlueLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*
+
+  ############################################
+  # IAM Role - Lambda
+  ############################################
+
+  LambdaStartGlueWorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaStartGlueWorkflowRole-v2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaStartGlueWorkflowPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartGlueWorkflow
+                Effect: Allow
+                Action:
+                  - glue:StartWorkflowRun
+                  - glue:PutWorkflowRunProperties
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:workflow/${GlueWorkflowName}
+              - Sid: LambdaLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+
+  ############################################
+  # Glue Data Catalog Database
+  ############################################
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+
+  ############################################
+  # Glue ETL Job (Python Shell)
+  ############################################
+
+  GlueETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref GlueJobName
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: '3.9'
+        ScriptLocation: !Sub s3://${InputBucketName}/${GlueScriptKey}
+      MaxCapacity: 0.0625
+      DefaultArguments:
+        --INPUT_PATH: !Sub s3://${InputBucketName}/input/
+        --OUTPUT_PATH: !Sub s3://${OutputBucketName}/output/
+      MaxRetries: 0
+
+  ############################################
+  # Glue Crawler
+  ############################################
+
+  GlueOutputCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: GlueDatabase
+    Properties:
+      Name: !Ref GlueCrawlerName
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${OutputBucketName}/output/
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  ############################################
+  # Glue Workflow + Triggers
+  ############################################
+
+  GlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Name: !Ref GlueWorkflowName
+      Description: emp-data ETL orchestration - job then crawler
+
+  StartTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: emp-etl-start-trigger-v2
+      Type: ON_DEMAND
+      WorkflowName: !Ref GlueWorkflowName
+      Actions:
+        - JobName: !Ref GlueJobName
+    DependsOn:
+      - GlueWorkflow
+      - GlueETLJob
+
+  CrawlerTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: emp-etl-crawler-trigger-v2
+      Type: CONDITIONAL
+      WorkflowName: !Ref GlueWorkflowName
+      StartOnCreation: true
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref GlueJobName
+            State: SUCCEEDED
+      Actions:
+        - CrawlerName: !Ref GlueCrawlerName
+    DependsOn:
+      - GlueWorkflow
+      - GlueETLJob
+      - GlueOutputCrawler
+
+  ############################################
+  # Lambda Function
+  ############################################
+
+  StartWorkflowLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaStartGlueWorkflowRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: !Sub |
+          import boto3
+
+          glue = boto3.client('glue')
+          WORKFLOW_NAME = '${GlueWorkflowName}'
+
+          def lambda_handler(event, context):
+              record = event['Records'][0]
+              bucket = record['s3']['bucket']['name']
+              key = record['s3']['object']['key']
+
+              file_path = f's3://{bucket}/{key}'
+              print(f"New file detected: {file_path}")
+
+              response = glue.start_workflow_run(Name=WORKFLOW_NAME)
+              run_id = response['RunId']
+
+              glue.put_workflow_run_properties(
+                  Name=WORKFLOW_NAME,
+                  RunId=run_id,
+                  RunProperties={'triggering_file': file_path}
+              )
+
+              print(f"Started workflow run {run_id} for {WORKFLOW_NAME}")
+              return {'statusCode': 200, 'body': f'Started workflow {WORKFLOW_NAME}, run ID {run_id}'}
+    DependsOn:
+      - GlueWorkflow
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartWorkflowLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${InputBucketName}
+      SourceAccount: !Ref AWS::AccountId
+
+  ############################################
+  # S3 -> Lambda Notification (Custom Resource)
+  #
+  # NOTE: Applying NotificationConfiguration directly on the AWS::S3::Bucket
+  # resource here would create a circular dependency (bucket needs the
+  # Lambda permission to exist first; the permission needs the bucket ARN).
+  # We avoid this by configuring notifications via a Lambda-backed custom
+  # resource that runs put_bucket_notification_configuration AFTER both
+  # the bucket and the Lambda permission already exist.
+  ############################################
+
+  NotificationConfigFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3NotificationConfigPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource:
+                  - !Sub arn:aws:s3:::${InputBucketName}
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+
+  NotificationConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt NotificationConfigFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              try:
+                  props = event['ResourceProperties']
+                  bucket = props['BucketName']
+                  lambda_arn = props['LambdaArn']
+
+                  if event['RequestType'] in ('Create', 'Update'):
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={
+                              'LambdaFunctionConfigurations': [
+                                  {
+                                      'LambdaFunctionArn': lambda_arn,
+                                      'Events': ['s3:ObjectCreated:*'],
+                                      'Filter': {
+                                          'Key': {
+                                              'FilterRules': [
+                                                  {'Name': 'prefix', 'Value': 'input/'},
+                                                  {'Name': 'suffix', 'Value': '.csv'}
+                                              ]
+                                          }
+                                      }
+                                  }
+                              ]
+                          }
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  BucketNotificationConfig:
+    Type: Custom::S3BucketNotification
+    DependsOn:
+      - LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt NotificationConfigFunction.Arn
+      BucketName: !Ref InputBucketName
+      LambdaArn: !GetAtt StartWorkflowLambda.Arn
+
+Outputs:
+  InputBucketNameOut:
+    Description: Input bucket name
+    Value: !Ref InputBucket
+
+  OutputBucketNameOut:
+    Description: Output bucket name
+    Value: !Ref OutputBucket
+
+  GlueJobNameOut:
+    Value: !Ref GlueETLJob
+
+  GlueWorkflowNameOut:
+    Value: !Ref GlueWorkflow
+
+  LambdaFunctionArnOut:
+    Value: !GetAtt StartWorkflowLambda.Arn
+
+  GlueDatabaseNameOut:
+    Value: !Ref GlueDatabaseName
