@@ -52,7 +52,7 @@ Resources:
 
   InputBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
+    DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref InputBucketName
@@ -68,7 +68,7 @@ Resources:
 
   OutputBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
+    DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref OutputBucketName
@@ -371,6 +371,7 @@ Resources:
         ZipFile: |
           import boto3
           import cfnresponse
+          from botocore.exceptions import ClientError
 
           s3 = boto3.client('s3')
 
@@ -398,18 +399,32 @@ Resources:
                                       }
                                   }
                               ]
+
                           }
                       )
                   elif event['RequestType'] == 'Delete':
-                      s3.put_bucket_notification_configuration(
-                          Bucket=bucket,
-                          NotificationConfiguration={}
-                      )
+                      try:
+                          s3.put_bucket_notification_configuration(
+                              Bucket=bucket,
+                              NotificationConfiguration={}
+                          )
+                      except ClientError as ce:
+                          # Bucket may already be gone (e.g. manually deleted, or
+                          # Retain policy left it and someone else removed it).
+                          # Deletion of this custom resource must not block stack
+                          # teardown in that case.
+                          if ce.response['Error']['Code'] not in ('NoSuchBucket', 'NotFound'):
+                              raise
 
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
               except Exception as e:
                   print(f"Error: {e}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                  # On Delete, always report SUCCESS so a missing/already-deleted
+                  # bucket never leaves the stack stuck in DELETE_FAILED.
+                  if event.get('RequestType') == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
 
   BucketNotificationConfig:
     Type: Custom::S3BucketNotification
