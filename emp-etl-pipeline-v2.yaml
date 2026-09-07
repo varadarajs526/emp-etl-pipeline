@@ -52,7 +52,6 @@ Resources:
 
   InputBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref InputBucketName
@@ -68,7 +67,6 @@ Resources:
 
   OutputBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
       BucketName: !Ref OutputBucketName
